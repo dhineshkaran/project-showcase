@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This CFN Template creates an AWS AMI using Image-Builder Service and IAM role for running EC2 instance that will act as Greengrass SCU simulator.
+
+Parameters:
+  SSHKey:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Select key-pair to ssh into the instance.
+
+  ScheduleExpression:
+    Description: Enter the schedule expression in cron format in UTC timezone (Schedule 10 minutes later). Cron Format :- Minute | Hour | Day of the month | Month | Day of the week | Year. Use a space between the values.
+    Type: String
+    Default: 'cron(0 13 10 11 ? 2023)'
+  
+  SecurityGroupID:
+    Description: Select security-group for image builder instance.
+    Type: 'List<AWS::EC2::SecurityGroup::Id>'
+
+  SubnetID:
+    Description: Select subnet for image builder instance.
+    Type: 'List<AWS::EC2::Subnet::Id>'
+
+
+Resources:
+  ImageBuilderComponent:
+    Type: 'AWS::ImageBuilder::Component'
+    Properties:
+      Name: 'ami-component-gg'
+      Platform: Linux
+      Version: '1.0.0'
+      Description: Image Builder Component which Installs Java 17 in Amazon Linux 2.
+      ChangeDescription: Initial version
+      SupportedOsVersions: 
+        - 'Amazon Linux 2023'
+      Data: |
+        name: Installing Java 17 - InlineData
+        description: Installing Java 17 in Amazon Linux 2
+        schemaVersion: 1.0
+
+        phases:
+          - name: build
+            steps:
+              - name: Java17Installation
+                action: ExecuteBash
+                inputs:
+                  commands:
+                      - yum install -y java-17-amazon-corretto-devel
+
+  DistributionConfiguration:
+    Type: 'AWS::ImageBuilder::DistributionConfiguration'
+    Properties:
+      Name: distributionConfiguration-gg
+      Description: 'Distribution Configuration of ami-component-gg.'
+      Distributions:
+        - Region: !Ref "AWS::Region"
+          AmiDistributionConfiguration:
+            Name: 'install_gg- {{ imagebuilder:buildDate }}'
+            Description: 'AMI with Amazon Linux 2023 as base image installed with Java 17.'
+            AmiTags:
+              AmiTagKey: 'ami-gg'
+          
+  ImageRecipe:
+    Type: 'AWS::ImageBuilder::ImageRecipe'
+    Properties:
+      Name: 'ami-gg-recipe'
+      Version: '1.0.0'
+      WorkingDirectory: /tmp
+      Description: 'Image recipe for ami creation to run install_gg.sh'
+      ParentImage: !Sub 'arn:aws:imagebuilder:${AWS::Region}:aws:image/amazon-linux-2023-x86/x.x.x'
+      Components:
+        - ComponentArn: !GetAtt ImageBuilderComponent.Arn
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: 30
+            VolumeType: gp2
+  
+  ImageBuilderInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'imagebuilder-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder
+  InstanceProfile: 
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      InstanceProfileName: 'imagebuilder-role'
+      Path: "/"
+      Roles: 
+        - 
+          Ref: "ImageBuilderInstanceRole"
+
+  InfrastructureConfiguration:
+    DependsOn: 
+    - ImageBuilderInstanceRole
+    - InstanceProfile
+    Type: 'AWS::ImageBuilder::InfrastructureConfiguration'
+    Properties:
+      Name: InfrastructureConfiguration-gg
+      Description: Infrastructure configuration for gg ami.
+      InstanceProfileName: 'imagebuilder-role'
+      InstanceTypes:
+        - 't2.micro'
+      KeyPair: !Ref SSHKey
+      SecurityGroupIds: !Ref SecurityGroupID
+      SubnetId: !Join [',', !Ref SubnetID]
+
+  ImagePipeline:
+    Type: 'AWS::ImageBuilder::ImagePipeline'
+    Properties:
+      Name: 'gg-ami-creation-image-pipeline'
+      Description: Pipeline to create AMI for gg_install.sh with Amazon Linux 2023 as base image installed with Java 17.
+      ImageRecipeArn: !GetAtt ImageRecipe.Arn
+      InfrastructureConfigurationArn: !GetAtt InfrastructureConfiguration.Arn
+      DistributionConfigurationArn: !GetAtt DistributionConfiguration.Arn
+      EnhancedImageMetadataEnabled: false
+      Status: ENABLED
+      Schedule:
+        ScheduleExpression: !Ref ScheduleExpression
+        PipelineExecutionStartCondition: 'EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE'
+  EC2InstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: GG-SimulatorRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub: arn:aws:iam::${AWS::AccountId}:role/rol-shared-cicd-jenkins-ec2
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: EC2InstancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:RunInstances'
+                  - 'ec2:TerminateInstances'
+                  - 'ec2:DescribeImages'
+                  - 'ec2:CreateTags'
+                  - 'ec2:DescribeInstanceTypes'
+                  - 'ec2:DescribeSubnets'
+                  - 'ec2:DescribeVpcs'
+                  - 'ec2:AssociateIamInstanceProfile'
+                  - 'ec2:CreateSecurityGroup'
+                  - 'ec2:AuthorizeSecurityGroupIngress'
+                  - 'ec2:DescribeSecurityGroups'
+                  - 'ec2:AllocateAddress'
+                  - 'ec2:DescribeInstances'
+                Resource: '*'
